@@ -1,0 +1,321 @@
+# setup
+
+import os
+import sys
+from functools import partial
+from pathlib import Path
+from typing import Callable
+
+import einops
+import plotly.express as px
+import plotly.graph_objects as go
+import torch as t
+from IPython.display import display
+from ipywidgets import interact
+from jaxtyping import Bool, Float
+from torch import Tensor
+from tqdm import tqdm
+
+# Make sure exercises are in the path
+chapter = "chapter0_fundamentals"
+section = "part1_ray_tracing"
+root_dir = next(p for p in Path.cwd().parents if (p / chapter).exists())
+exercises_dir = root_dir / chapter / "exercises"
+section_dir = exercises_dir / section
+if str(exercises_dir) not in sys.path:
+    sys.path.append(str(exercises_dir))
+
+import part1_ray_tracing.tests as tests
+from part1_ray_tracing.utils import (
+    render_lines_with_plotly,
+    setup_widget_fig_ray,
+    setup_widget_fig_triangle,
+)
+from plotly_utils import imshow
+
+MAIN = __name__ == "__main__"
+
+
+def make_rays_1d(num_pixels: int, y_limit: float) -> Tensor:
+    """
+    num_pixels: The number of pixels in the y dimension. Since there is one ray per pixel, this is
+        also the number of rays.
+    y_limit: At x=1, the rays should extend from -y_limit to +y_limit, inclusive of both endpoints.
+
+    Returns: shape (num_pixels, num_points=2, num_dim=3) where the num_points dimension contains
+        (origin, direction) and the num_dim dimension contains xyz.
+
+    Example of make_rays_1d(9, 1.0): [
+        [[0, 0, 0], [1, -1.0, 0]],
+        [[0, 0, 0], [1, -0.75, 0]],
+        [[0, 0, 0], [1, -0.5, 0]],
+        ...
+        [[0, 0, 0], [1, 0.75, 0]],
+        [[0, 0, 0], [1, 1, 0]],
+    ]
+    """
+    # [0, 0, 0]
+    # to
+    # zs are 0
+    # xs are 1
+    # ys are linspace
+
+    rays = t.zeros((num_pixels, 2, 3))
+    rays[:,1,0] = 1
+    rays[:,1,1] = t.linspace(-1 * y_limit, y_limit, num_pixels)
+    return rays
+    
+
+rays1d = make_rays_1d(9, 10.0)
+fig = render_lines_with_plotly(rays1d)
+
+
+def intersect_ray_1d(ray: Float[Tensor, "points dims"], segment: Float[Tensor, "points dims"]) -> bool:
+    """
+    ray: shape (n_points=2, n_dim=3)  # O, D points
+    segment: shape (n_points=2, n_dim=3)  # L_1, L_2 points
+
+    Return True if the ray intersects the segment.
+    """
+
+    # use t.stack and t.linalg.solve
+    # t.linalg.solve(A, B) asks "which k vectors get mapped to the k row vectors of B by the isomorphism of R^n A?"
+    # (D, L2 - L2)(cand)= L1-O
+    o = ray[0]
+    d = ray[1]
+    l1 = segment[0]
+    l2 = segment[1]
+    A = t.stack((d[:2], l1[:2] - l2[:2]), dim=1)
+    B = (l1 - o)[:2]
+    try:
+        candidate = t.linalg.solve(A, B)
+    except RuntimeError:
+        return False
+    return candidate[0] >= 0 and candidate[1] >= 0 and candidate[1] <= 1
+
+
+tests.test_intersect_ray_1d(intersect_ray_1d)
+tests.test_intersect_ray_1d_special_case(intersect_ray_1d)
+
+def intersect_rays_1d(
+    rays: Float[Tensor, "nrays 2 3"], segments: Float[Tensor, "nsegments 2 3"]
+) -> Bool[Tensor, " nrays"]:
+    """
+    For each ray, return True if it intersects any segment.
+    """
+
+    # build a bool array nrays by nsegments that gives whether each intersection is valid
+    nr = rays.shape[0]
+    ns = segments.shape[0]
+
+    rays = einops.repeat(rays,"batch points coords -> n batch points coords", n=ns)
+    segments = einops.repeat(segments, "batch points coords -> batch n points coords", n=nr)
+
+    o = rays[...,0,:2]
+    d = rays[...,1,:2]
+    l1 = segments[...,0,:2]
+    l2 = segments[...,1,:2]
+    #all these should have shape (ns nr 2)
+
+    
+    A = t.stack((d, l1 - l2), dim=3)
+    #(ns nr 2 2)
+    B = l1 - o
+    #(ns nr 2)
+
+    #find and replace singular As
+    is_singular = t.linalg.det(A).abs() <= 1e-8
+    A[is_singular] = t.eye(2)
+
+    #does this work batched like I want it to?
+    candidates = t.linalg.solve(A, B)
+    #(ns nr 1 2)
+
+    solutions = (candidates[...,0] >= 0) & (candidates[...,1] >= 0) & (candidates[...,1] <= 1)
+    solutions[is_singular] = False
+    return solutions.any(dim=0)
+
+
+tests.test_intersect_rays_1d(intersect_rays_1d)
+tests.test_intersect_rays_1d_special_case(intersect_rays_1d)
+
+
+def make_rays_2d(num_pixels_y: int, num_pixels_z: int, y_limit: float, z_limit: float) -> Float[Tensor, "nrays 2 3"]:
+    """
+    num_pixels_y: The number of pixels in the y dimension
+    num_pixels_z: The number of pixels in the z dimension
+
+    y_limit: At x=1, the rays should extend from -y_limit to +y_limit, inclusive of both.
+    z_limit: At x=1, the rays should extend from -z_limit to +z_limit, inclusive of both.
+
+    Returns: shape (num_rays=num_pixels_y * num_pixels_z, num_points=2, num_dims=3).
+    """
+    rays = t.zeros((num_pixels_y, num_pixels_z, 2, 3))
+    rays[:,:,1,0] = 1
+    rays[:,:,1,1] = t.linspace(-y_limit, y_limit, num_pixels_y).unsqueeze(1)
+    rays[:,:,1,2] = t.linspace(-z_limit, z_limit, num_pixels_z).unsqueeze(0)
+    return einops.rearrange(rays, "ny nz points dims -> (ny nz) points dims")
+    raise NotImplementedError()
+
+
+
+rays_2d = make_rays_2d(10, 10, 0.3, 0.3)
+render_lines_with_plotly(rays_2d)
+
+
+
+
+Point = Float[Tensor, "points=3"]
+
+
+def triangle_ray_intersects(A: Point, B: Point, C: Point, O: Point, D: Point) -> bool:
+    """
+    A: shape (3,), one vertex of the triangle
+    B: shape (3,), second vertex of the triangle
+    C: shape (3,), third vertex of the triangle
+    O: shape (3,), origin point
+    D: shape (3,), direction point
+
+    Return True if the ray and the triangle intersect.
+    """
+
+    #  the triangle and ray intersect if
+    #   for (- D (B - A) (C - A))(suv)T = (O-A)
+    # suv exists and
+    # s >= 0, 0 <= u, v, and u + v <= 1.
+
+    mat = t.stack((-1 * D, (B - A), (C - A)), dim=-1)
+    try:
+        s, u, v = t.linalg.solve(mat, (O - A))
+    except RuntimeError:
+        return False
+    return (s >= 0) & (u >= 0) & (v >= 0) & (u + v <= 1)
+
+
+tests.test_triangle_ray_intersects(triangle_ray_intersects)
+
+
+
+def raytrace_triangle(
+    rays: Float[Tensor, "nrays rayPoints=2 dims=3"],
+    triangle: Float[Tensor, "trianglePoints=3 dims=3"],
+) -> Bool[Tensor, " nrays"]:
+    """
+    For each ray, return True if the triangle intersects that ray.
+    """
+
+
+    #  the triangle and ray intersect if
+    #   for (- D (B - A) (C - A))(suv)T = (O-A)
+    # suv exists and
+    # s >= 0, 0 <= u, v, and u + v <= 1.
+
+    nrays = rays.shape[0]
+
+    triangles = einops.repeat(triangle, "p d -> n p d", n=nrays)
+
+    A = triangles[:,0,:]
+    B = triangles[:,1,:]
+    C = triangles[:,2,:]
+    D = rays[:,1,:]
+    O = rays[:,0,:]
+    mat = t.stack((-1 * D, (B - A), (C - A)), dim=-1)
+
+    is_singular = t.linalg.det(mat).abs() <= 1e-8
+    mat[is_singular] = t.eye(3)
+   
+    s, u, v = t.linalg.solve(mat, (O - A)).unbind(dim=-1)
+
+    candidates = (s >= 0) & (u >= 0) & (v >= 0) & (u + v <= 1)
+    candidates[is_singular] = False
+    return candidates
+
+
+A = t.tensor([1, 0.0, -0.5])
+B = t.tensor([1, -0.5, 0.0])
+C = t.tensor([1, 0.5, 0.5])
+num_pixels_y = num_pixels_z = 15
+y_limit = z_limit = 0.5
+
+# Plot triangle & rays
+test_triangle = t.stack([A, B, C], dim=0)
+rays2d = make_rays_2d(num_pixels_y, num_pixels_z, y_limit, z_limit)
+triangle_lines = t.stack([A, B, C, A, B, C], dim=0).reshape(-1, 2, 3)
+render_lines_with_plotly(rays2d, triangle_lines)
+
+# Calculate and display intersections
+intersects = raytrace_triangle(rays2d, test_triangle)
+img = intersects.reshape(num_pixels_y, num_pixels_z).int()
+imshow(img, origin="lower", width=600, title="Triangle (as intersected by rays)", renderer="browser")
+
+
+
+def raytrace_mesh(
+    rays: Float[Tensor, "nrays rayPoints=2 dims=3"],
+    triangles: Float[Tensor, "ntriangles trianglePoints=3 dims=3"],
+) -> Float[Tensor, " nrays"]:
+    """
+    For each ray, return the distance to the closest intersecting triangle, or infinity.
+    """
+
+    nrays = rays.shape[0]
+    ntriangles = triangles.shape[0]
+
+    triangles = einops.repeat(triangles, "nt p d -> nr nt p d", nr=nrays)
+    rays = einops.repeat(rays, "nr p d -> nr nt p d", nt=ntriangles)
+
+    A = triangles[...,0,:]
+    B = triangles[...,1,:]
+    C = triangles[...,2,:]
+    D = rays[...,1,:]
+    O = rays[...,0,:]
+
+    mat = t.stack((-1 * D, (B - A), (C - A)), dim=-1)
+
+    is_singular = t.linalg.det(mat).abs() <= 1e-8
+    mat[is_singular] = t.eye(3)
+   
+    s, u, v = t.linalg.solve(mat, (O - A)).unbind(dim=-1)
+
+    candidates = (s >= 0) & (u >= 0) & (v >= 0) & (u + v <= 1)
+    candidates[is_singular] = False
+    s[~candidates] = t.inf
+    return s.min(dim=-1).values
+
+
+
+triangles = t.load(section_dir / "pikachu.pt", weights_only=True)
+
+num_pixels_y = 120
+num_pixels_z = 120
+y_limit = z_limit = 1
+
+rays = make_rays_2d(num_pixels_y, num_pixels_z, y_limit, z_limit)
+rays[:, 0] = t.tensor([-2, 0.0, 0.0])
+dists = raytrace_mesh(rays, triangles)
+intersects = t.isfinite(dists).view(num_pixels_y, num_pixels_z)
+dists_square = dists.view(num_pixels_y, num_pixels_z)
+img = t.stack([intersects, dists_square], dim=0)
+
+fig = px.imshow(img, facet_col=0, origin="lower", color_continuous_scale="magma", width=1000)
+fig.update_layout(coloraxis_showscale=False)
+for i, text in enumerate(["Intersects", "Distance"]):
+    fig.layout.annotations[i]["text"] = text
+fig.show(renderer="browser")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
