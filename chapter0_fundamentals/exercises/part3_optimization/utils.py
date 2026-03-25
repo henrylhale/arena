@@ -125,7 +125,7 @@ def plot_fn(
     elif return_fig:
         return fig
     else:
-        fig.show(config=CONFIG)
+        fig.show(config=CONFIG, renderer="browser")
 
 
 def format_name(name, params):
@@ -183,8 +183,8 @@ def plot_fn_with_points(
 
     if filename is not None:
         fig.write_html(filename, config=CONFIG)
-        fig.show(config=CONFIG)
+        fig.show(config=CONFIG,renderer="browser")
     elif return_fig:
         return fig
     else:
-        fig.show(config=CONFIG)
+        fig.show(config=CONFIG,renderer="browser")
