@@ -24,7 +24,7 @@ echo 'alias vim=nvim' >> ~/.bashrc
 
 echo "==> [2/5] Pulling dotfiles (nvim, tmux)"
 git clone --depth=1 \
-  "https://github.com/${GITHUB_USER}/${DOTFILES_REPO}.git" \
+  "git@github.com:${GITHUB_USER}/${DOTFILES_REPO}.git" \
   ~/configs
 
 mkdir -p ~/.config
@@ -40,7 +40,7 @@ nvim --headless "+Lazy! sync" +qa || true
 
 echo "==> [4/5] Pulling ARENA repo"
 git clone --depth=1 \
-  "https://github.com/${GITHUB_USER}/${ARENA_REPO}.git" \
+  "git@github.com:${GITHUB_USER}/${ARENA_REPO}.git" \
   ~/arena
 
 echo "==> [5/6] Creating conda environment from environment.yml"
