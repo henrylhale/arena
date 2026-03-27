@@ -36,7 +36,7 @@ def visualize(dataloader, filename: str | None = None):
     fig.update_xaxes(showticklabels=False).update_yaxes(showticklabels=False)
     fig.update_layout(margin=dict(t=40, b=20, r=20, l=20), width=1000)
 
-    fig.show(config={"displayModeBar": False})
+    fig.show(config={"displayModeBar": False}, renderer="browser")
     if filename is not None:
         fig.write_html(filename, config={"displayModeBar": False})
 
