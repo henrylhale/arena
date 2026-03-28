@@ -62,7 +62,7 @@ def visualise_output(
         yaxis=dict(title_text="dim2", **tickargs),
         width=40 * (n_points + 5),
         height=40 * (n_points + 4),
-    ).show()
+    ).show(renderer="browser")
 
 
 @t.inference_mode()
@@ -91,7 +91,7 @@ def visualise_input(
     data_translated = (HOLDOUT_DATA.cpu().numpy() * 0.3081) + 0.1307
     data_as_int = (255 * data_translated).astype(np.uint8).squeeze()
     for i in range(10):
-        x, y = holdout_latent_vectors[i]
+        x, y = holdout_latent_vectors.cpu().numpy()[i]
         fig.add_layout_image(
             source=Image.fromarray(data_as_int[i]).convert("L"),
             xref="x",
@@ -103,6 +103,18 @@ def visualise_input(
             sizex=data_range / 15,
             sizey=data_range / 15,
         )
-    fig.show()
+    # fig.show(renderer="browser")
     if filename is not None:
         fig.write_html(filename)
+
+
+
+
+
+
+
+
+
+
+
+
