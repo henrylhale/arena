@@ -12,22 +12,41 @@ import torch.nn as nn
 from eindex import eindex
 from IPython.display import display
 
-# Plotly remote viewer: writes each fig.show() to /tmp/plotly_html/latest.html
-# served on port 8050. SSH with -L 8050:localhost:8050, then open localhost:8050
+# Plotly remote viewer: each fig.show() writes a numbered HTML file and updates
+# an index page at /tmp/plotly_html/index.html with links to all plots.
+# SSH with -L 8050:localhost:8050, then open http://localhost:8050 in your browser.
 _plotly_dir = Path("/tmp/plotly_html")
 _plotly_dir.mkdir(exist_ok=True)
-_orig_fig_show = pio.show
+_plotly_counter = 0
+
+def _rebuild_index():
+    plots = sorted(_plotly_dir.glob("plot_*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    links = "\n".join(
+        f'<li><a href="{p.name}" target="_blank">{p.stem.replace("_", " ")}</a></li>'
+        for p in plots
+    )
+    (_plotly_dir / "index.html").write_text(
+        f"<html><head><title>Plots</title></head><body>"
+        f"<h2>Plots (newest first)</h2><ul>{links}</ul>"
+        f"<script>setTimeout(()=>location.reload(), 2000)</script>"
+        f"</body></html>"
+    )
 
 def _remote_fig_show(fig, *args, **kwargs):
-    path = _plotly_dir / "latest.html"
+    global _plotly_counter
+    _plotly_counter += 1
+    title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else f"plot {_plotly_counter}"
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip().replace(" ", "_")
+    filename = f"plot_{_plotly_counter:03d}_{safe_title}.html"
+    path = _plotly_dir / filename
     fig.write_html(str(path), auto_open=False)
-    print(f"Plot written to {path} — refresh browser at http://localhost:8050")
+    _rebuild_index()
+    print(f"Plot #{_plotly_counter} written — view at http://localhost:8050")
 
-pio.show = _remote_fig_show
 import plotly.graph_objects as _go
 _go.Figure.show = lambda self, *a, **kw: _remote_fig_show(self, *a, **kw)
 from jaxtyping import Float, Int
-from torch import T_co, Tensor
+from torch import Tensor
 from tqdm import tqdm
 from transformer_lens import (
     ActivationCache,
@@ -65,6 +84,7 @@ pio.renderers.default = "png"
 t.set_grad_enabled(False)
 
 MAIN = __name__ == "__main__"
+
 
 
 
@@ -266,6 +286,16 @@ imshow(
 
 
 
+
+rep_cache["result",0,1].shape
+rep_cache.keys
+
+
+rep_cache["embed"].shape
+rep_cache["pos_embed"].shape
+t.allclose(rep_cache["result", 0, 1], rep_cache["result", 0])
+rep_cache.model.cfg.n_heads
+
 def decompose_qk_input(cache: ActivationCache) -> Float[Tensor, "n_heads+2 posn d_model"]:
     """
     Retrieves all the input tensors to the first attention layer, and concatenates them along the
@@ -274,7 +304,15 @@ def decompose_qk_input(cache: ActivationCache) -> Float[Tensor, "n_heads+2 posn 
     The [i, :, :]th element is y_i (from notation above). The sum of these tensors along the 0th
     dim should be the input to the first attention layer.
     """
-    raise NotImplementedError()
+
+    y0 = cache["embed"].unsqueeze(0)  # shape (1, seq, d_model)
+    y1 = cache["pos_embed"].unsqueeze(0)  # shape (1, seq, d_model)
+    y_rest = cache["result", 0].transpose(0, 1)  # shape (12, seq, d_model)
+
+    return t.concat([y0, y1, y_rest], dim=0)
+
+
+
 
 
 def decompose_q(
@@ -287,7 +325,8 @@ def decompose_q(
 
     The [i, :, :]th element is y_i @ W_Q (so the sum along axis 0 is just the q-values).
     """
-    raise NotImplementedError()
+
+    return einops.einsum(decomposed_qk_input, model.W_Q[1][ind_head_index], "i posn d_model, d_model d_head -> i posn d_head")
 
 
 def decompose_k(
@@ -300,7 +339,7 @@ def decompose_k(
 
     The [i, :, :]th element is y_i @ W_K(so the sum along axis 0 is just the k-values)
     """
-    raise NotImplementedError()
+    return einops.einsum(decomposed_qk_input, model.W_K[1][ind_head_index], "i posn d_model, d_model d_head -> i posn d_head")
 
 
 # Recompute rep tokens/logits/cache, if we haven't already
@@ -337,19 +376,156 @@ for decomposed_input, name in [(decomposed_q, "query"), (decomposed_k, "key")]:
     )
 
 
+def decompose_attn_scores(
+    decomposed_q: Float[Tensor, "q_comp q_pos d_head"],
+    decomposed_k: Float[Tensor, "k_comp k_pos d_head"],
+    model: HookedTransformer,
+) -> Float[Tensor, "q_comp k_comp q_pos k_pos"]:
+    """
+    Output is decomposed_scores with shape [query_component, key_component, query_pos, key_pos]
+
+    The [i, j, 0, 0]th element is y_i @ W_QK @ y_j^T (so the sum along both first axes are the
+    attention scores)
+    """
+
+    return einops.einsum(decomposed_q, decomposed_k, "q_comp q_pos d_head, k_comp k_pos d_head -> q_comp k_comp q_pos k_pos") / (model.cfg.d_head ** 0.5)
+
+tests.test_decompose_attn_scores(decompose_attn_scores, decomposed_q, decomposed_k, model)
 
 
 
+# First plot: attention score contribution from (query_component, key_component) = (Embed, L0H7), you can replace this
+# with any other pair and see that the values are generally much smaller, i.e. this pair dominates the attention score
+# calculation
+decomposed_scores = decompose_attn_scores(decomposed_q, decomposed_k, model)
+
+q_label = "Embed"
+k_label = "0.6"
+decomposed_scores_from_pair = decomposed_scores[component_labels.index(q_label), component_labels.index(k_label)]
+
+imshow(
+    utils.to_numpy(t.tril(decomposed_scores_from_pair)),
+    title=f"Attention score contributions from query = {q_label}, key = {k_label}<br>(by query & key sequence positions)",
+    width=700,
+)
+
+
+# Second plot: std dev over query and key positions, shown by component. This shows us that the other pairs of
+# (query_component, key_component) are much less important, without us having to look at each one individually like we
+# did in the first plot!
+decomposed_stds = einops.reduce(
+    decomposed_scores, "query_decomp key_decomp query_pos key_pos -> query_decomp key_decomp", t.std
+)
+imshow(
+    utils.to_numpy(decomposed_stds),
+    labels={"x": "Key Component", "y": "Query Component"},
+    title="Std dev of attn score contributions across sequence positions<br>(by query & key comp)",
+    x=component_labels,
+    y=component_labels,
+    width=700,
+)
+
+
+def find_K_comp_full_circuit(
+    model: HookedTransformer, prev_token_head_index: int, ind_head_index: int
+) -> FactoredMatrix:
+    """
+    Returns a (vocab, vocab)-size FactoredMatrix, with the first dimension being the query side
+    (direct from token embeddings) and the second dimension being the key side (going via the
+    previous token head).
+    """
+    # want W_E W_QK^1.4 W_OV^0.7^T W_E^T
+
+    
+    W_OV = FactoredMatrix(model.W_V[0][prev_token_head_index], model.W_O[0][prev_token_head_index])
+    W_QK = FactoredMatrix(model.W_Q[1][ind_head_index], model.W_K[1][ind_head_index].T)
+    return model.W_E @ W_QK @ W_OV.T @ model.W_E.T
+
+prev_token_head_index = 7
+ind_head_index = 10 
+K_comp_circuit = find_K_comp_full_circuit(model, prev_token_head_index, ind_head_index)
+
+tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
+
+print(f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}")
 
 
 
+# bonus
+
+def get_comp_score(W_A: Float[Tensor, "in_A out_A"], W_B: Float[Tensor, "out_A out_B"]) -> float:
+    """
+    Return the composition score between W_A and W_B.
+    """
+
+    return t.linalg.matrix_norm(W_A @ W_B).item() / (t.linalg.matrix_norm(W_A).item() * t.linalg.matrix_norm(W_B).item())
+
+
+tests.test_get_comp_score(get_comp_score)
+
+
+# Get all QK and OV matrices
+W_QK = model.W_Q @ model.W_K.transpose(-1, -2)
+W_OV = model.W_V @ model.W_O
+
+# Define tensors to hold the composition scores
+composition_scores = {
+    "Q": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+    "K": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+    "V": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+}
+
+for i in range(model.cfg.n_heads):
+    for j in range(model.cfg.n_heads):
+        composition_scores["Q"][i, j] = get_comp_score(W_OV[0][i], W_QK[1][j])
+        composition_scores["K"][i, j] = get_comp_score(W_OV[0][i], W_QK[1][j].T)
+        composition_scores["V"][i, j] = get_comp_score(W_OV[0][i], W_OV[1][j])
+
+
+# Plot the composition scores
+for comp_type in ["Q", "K", "V"]:
+    plot_comp_scores(model, composition_scores[comp_type], f"{comp_type} Composition Scores")
+
+
+def generate_single_random_comp_score() -> float:
+    """
+    Write a function which generates a single composition score for random matrices
+    """
+    W_A_left = t.empty(model.cfg.d_model, model.cfg.d_head)
+    W_B_left = t.empty(model.cfg.d_model, model.cfg.d_head)
+    W_A_right = t.empty(model.cfg.d_model, model.cfg.d_head)
+    W_B_right = t.empty(model.cfg.d_model, model.cfg.d_head)
+
+    for W in [W_A_left, W_B_left, W_A_right, W_B_right]:
+        nn.init.kaiming_uniform_(W, a=np.sqrt(5))
+
+    W_A = W_A_left @ W_A_right.T
+    W_B = W_B_left @ W_B_right.T
+
+    return get_comp_score(W_A, W_B)
+
+
+n_samples = 300
+comp_scores_baseline = np.zeros(n_samples)
+for i in tqdm(range(n_samples)):
+    comp_scores_baseline[i] = generate_single_random_comp_score()
+
+print("\nMean:", comp_scores_baseline.mean())
+print("Std:", comp_scores_baseline.std())
+
+hist(
+    comp_scores_baseline,
+    nbins=50,
+    width=800,
+    labels={"x": "Composition score"},
+    title="Random composition scores",
+)
 
 
 
-
-
-
-
+baseline = comp_scores_baseline.mean()
+for comp_type, comp_scores in composition_scores.items():
+    plot_comp_scores(model, comp_scores, f"{comp_type} Composition Scores", baseline=baseline)
 
 
 
